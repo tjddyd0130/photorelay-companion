@@ -55,4 +55,26 @@ class CompanionTest {
         assertEquals(null, Updater.assetVersionCode("photorelay-companion-vc7.apk.sha1"))
         assertEquals(null, Updater.assetVersionCode("other-vc7.apk"))
     }
+
+    @Test
+    fun keepDaysUsesLaterOfTakenAndAdded() {
+        val day = 86_400_000L
+        val now = 100 * day
+        // 촬영일은 오래됐지만 오늘 폰에 들어온 사진은 "최근"으로 본다
+        assertEquals(now, Cleaner.recentOf(now - 50 * day, now))
+        // 촬영일이 없으면(0) 추가 시각
+        assertEquals(now - 5 * day, Cleaner.recentOf(0, now - 5 * day))
+        assertTrue(Cleaner.isOldEnough(Cleaner.recentOf(now - 50 * day, now - 10 * day), now, 3))
+        assertTrue(!Cleaner.isOldEnough(Cleaner.recentOf(now - 50 * day, now), now, 3))
+    }
+
+    @Test
+    fun signatureMatchesKnownVector() {
+        // RFC 4231 test case 2: key "Jefe", data "what do ya want for nothing?"
+        assertEquals("5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843", Sig.hmacHex("Jefe", "what do ya want for nothing?"))
+        assertTrue(Sig.matches("abcd", "abcd"))
+        assertTrue(!Sig.matches("abcd", "abce"))
+        assertTrue(!Sig.matches("abcd", null))
+        assertTrue(!Sig.matches("abcd", "abc"))
+    }
 }

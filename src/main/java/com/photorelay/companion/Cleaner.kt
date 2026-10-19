@@ -27,12 +27,18 @@ data class CleanResult(
     val timedOut: Boolean = false,
     val preview: Boolean = true,
     val noAlbums: Boolean = false,
+    /** 지문을 못 읽은 파일 수 (권한 부족, 읽기 오류). 0이 아니면 원인을 보여 줘야 한다 */
+    val hashFailed: Int = 0,
+    /** 작업 중 시스템이 멈춰 달라고 해서(충전 끊김 등) 중간에 그만둔 경우 */
+    val stopped: Boolean = false,
 ) {
     fun text(): String {
         if (noAlbums) return "정리할 앨범을 먼저 고르세요"
         val gb = "%.2fGB".format((if (preview) inGooglePhotosBytes else freedBytes) / 1073741824.0)
         val more = (if (notRelayed > 0) " · S7 경유 아님 ${notRelayed}개 보존" else "") +
-            (if (timedOut) " · 지문 계산은 다음 실행에서 이어서" else "")
+            (if (hashFailed > 0) " · 지문 못 읽음 ${hashFailed}개 (사진 위치 권한 확인)" else "") +
+            (if (timedOut) " · 지문 계산은 다음 실행에서 이어서" else "") +
+            (if (stopped) " · 중단됨, 다음 실행에서 이어서" else "")
         return if (preview) "미리보기: 지울 수 있음 ${inGooglePhotos}개($gb) · 아직 백업 안 됨 ${notYetBackedUp}개$more"
         else "정리: ${deleted}개 삭제($gb 확보) · 아직 백업 안 됨 ${notYetBackedUp}개$more"
     }
@@ -62,13 +68,22 @@ private class HashCache(context: Context) : SQLiteOpenHelper(context, "hash.db",
  * 메인폰 정리: 갤러리 사진의 지문을 S7에 물어서, 구글포토에 원본 화질로 확인된 것만 지운다.
  * OneDrive 앱의 "저장용량 확보" 버튼을 대신하되, 기준은 "OneDrive 업로드"가 아니라 "구글포토 확인"이라 더 안전하다.
  */
-class Cleaner(private val ctx: Context, private val progress: (String) -> Unit = {}) {
+class Cleaner(
+    private val ctx: Context,
+    private val progress: (String) -> Unit = {},
+    /** WorkManager가 멈추라고 하면(충전 끊김, 시간 제한) true — 긴 반복 중에 확인한다 */
+    private val shouldStop: () -> Boolean = { false },
+) {
     private val resolver: ContentResolver = ctx.contentResolver
     private val prefs = CompanionPrefs(ctx)
     private val cache = HashCache(ctx)
 
     fun run(budgetMs: Long = 8 * 60 * 1000L): CleanResult {
         check(prefs.paired) { "S7과 연결되지 않음" }
+        // 원본 바이트(GPS 포함)로 지문을 내야 구글포토와 맞는다. 이 권한이 없으면 전부 못 읽으므로 미리 알린다.
+        check(ctx.checkSelfPermission(android.Manifest.permission.ACCESS_MEDIA_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            "사진 위치 정보 권한이 없어 지문을 낼 수 없음 (앱 권한에서 허용)"
+        }
         val started = System.currentTimeMillis()
         progress("S7 연결 확인")
         val client = connect()
@@ -89,8 +104,10 @@ class Cleaner(private val ctx: Context, private val progress: (String) -> Unit =
             val cached = cache.get(p)
             if (cached != null) { keys[p] = cached; continue }
             if (System.currentTimeMillis() - started > budgetMs) { r = r.copy(timedOut = true); break }
+            if (shouldStop()) { r = r.copy(stopped = true); break }
             progress("지문 계산 ${i + 1}/${old.size}: ${p.name}")
-            val k = hash(p.uri) ?: continue
+            val k = hash(p.uri)
+            if (k == null) { r = r.copy(hashFailed = r.hashFailed + 1); continue }
             cache.put(p, k)
             keys[p] = k
             r = r.copy(hashed = r.hashed + 1)
@@ -112,6 +129,7 @@ class Cleaner(private val ctx: Context, private val progress: (String) -> Unit =
         if (real) {
             for ((i, e) in targets.entries.withIndex()) {
                 val (p, k) = e
+                if (shouldStop() || System.currentTimeMillis() - started > budgetMs + DELETE_BUDGET_MS) { r = r.copy(stopped = true); break }
                 progress("삭제 ${i + 1}/${targets.size}: ${p.name}")
                 // 지우기 직전 재확인: 파일 내용이 그대로인지
                 if (hash(p.uri) != k) continue
@@ -124,7 +142,7 @@ class Cleaner(private val ctx: Context, private val progress: (String) -> Unit =
         }
         prefs.lastResult = r.text()
         prefs.lastRunMs = System.currentTimeMillis()
-        client.report("${Build.MODEL}: ${r.text()}")
+        client.report("${deviceName(ctx)}: ${r.text()}")
         return r
     }
 
@@ -137,8 +155,9 @@ class Cleaner(private val ctx: Context, private val progress: (String) -> Unit =
         fun use(host: String, port: Int): RelayClient {
             prefs.host = host
             prefs.port = port
-            prefs.knownHosts = prefs.knownHosts + host
-            return RelayClient(host, port, prefs.token)
+            // 최근 주소 몇 개만 (오래 쓰면 주소가 쌓여 매번 다 두드리게 된다)
+            prefs.knownHosts = (listOf(host) + (prefs.knownHosts - host)).take(MAX_KNOWN_HOSTS).toSet()
+            return RelayClient(host, port, prefs.token, prefs.secret)
         }
         if (alive(prefs.host, prefs.port)) return use(prefs.host, prefs.port)
         progress("S7 주소 다시 찾는 중")
@@ -164,7 +183,8 @@ class Cleaner(private val ctx: Context, private val progress: (String) -> Unit =
             )?.use { c ->
                 while (c.moveToNext()) {
                     val id = c.getLong(0)
-                    val taken = if (c.isNull(3)) c.getLong(4) * 1000 else c.getLong(3)
+                    // "최근 N일 보존"은 폰에 들어온 시각 기준도 본다: 촬영일이 오래된 사진(카톡으로 받은 것 등)이 오자마자 지워지지 않게
+                    val taken = recentOf(if (c.isNull(3)) 0 else c.getLong(3), c.getLong(4) * 1000)
                     out += LocalPhoto(ContentUris.withAppendedId(col, id), id, c.getString(1) ?: "", c.getLong(2), taken, c.getLong(5))
                 }
             }
@@ -194,6 +214,18 @@ class Cleaner(private val ctx: Context, private val progress: (String) -> Unit =
     }
 
     companion object {
+        private const val MAX_KNOWN_HOSTS = 5
+        private const val DELETE_BUDGET_MS = 90 * 1000L
+
+        /** 촬영 시각과 추가 시각 중 늦은 쪽 (0이나 음수는 없는 값으로 본다) */
+        fun recentOf(takenMs: Long, addedMs: Long) = maxOf(if (takenMs > 0) takenMs else 0L, addedMs)
+
+        /** 같은 모델이 두 대라 S7 기록에서 구별되도록 사용자가 정한 기기 이름을 붙인다 */
+        fun deviceName(ctx: Context): String {
+            val custom = runCatching { android.provider.Settings.Global.getString(ctx.contentResolver, "device_name") }.getOrNull()
+            return if (custom.isNullOrBlank() || custom == Build.MODEL) Build.MODEL else "$custom (${Build.MODEL})"
+        }
+
         // 지연 초기화: 순수 함수(selectTargets 등)를 JVM 단위 테스트에서 쓸 때 MediaStore를 건드리지 않도록
         private val COLLECTIONS by lazy {
             listOf(

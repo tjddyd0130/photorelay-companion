@@ -39,6 +39,8 @@ class CompanionPrefs(context: Context) {
     var host: String get() = p.getString("host", "")!!; set(v) = p.edit().putString("host", v).apply()
     var port: Int get() = p.getInt("port", 47321); set(v) = p.edit().putInt("port", v).apply()
     var token: String get() = p.getString("token", "")!!; set(v) = p.edit().putString("token", v).apply()
+    /** 짝짓기 때 S7이 준 응답 서명 비밀값. 요청에는 절대 싣지 않으므로 가짜 서버는 알 수 없다 (없으면 예전 짝짓기) */
+    var secret: String get() = p.getString("secret", "")!!; set(v) = p.edit().putString("secret", v).apply()
     var serverName: String get() = p.getString("serverName", "")!!; set(v) = p.edit().putString("serverName", v).apply()
     val paired: Boolean get() = token.isNotBlank()
     /** S7이 지금까지 쓴 주소들 (집·회사처럼 Wi-Fi가 바뀌면 주소도 바뀐다) */
@@ -62,20 +64,42 @@ class CompanionPrefs(context: Context) {
     var updateStatus: String get() = p.getString("updateStatus", "")!!; set(v) = p.edit().putString("updateStatus", v).apply()
     var totalFreed: Long get() = p.getLong("totalFreed", 0); set(v) = p.edit().putLong("totalFreed", v).apply()
 
-    fun unpair() = p.edit().remove("token").remove("serverName").apply()
+    /** 연결 해제: 다음에 다른 S7과 연결돼도 바로 지우지 않도록 실제 삭제도 끈다 */
+    fun unpair() = p.edit().remove("token").remove("secret").remove("serverName").putBoolean("realDelete", false).apply()
+}
+
+/** 응답 서명: S7이 HMAC-SHA256(secret, 응답 본문)을 X-Signature 헤더로 보내고, 메인폰이 같은 값을 계산해 비교한다 */
+object Sig {
+    fun hmacHex(secret: String, body: String): String {
+        val mac = javax.crypto.Mac.getInstance("HmacSHA256")
+        mac.init(javax.crypto.spec.SecretKeySpec(secret.toByteArray(Charsets.UTF_8), "HmacSHA256"))
+        return mac.doFinal(body.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
+    }
+
+    /** 길이와 내용이 모두 같아야 (타이밍 차이로 새지 않게 상수 시간 비교) */
+    fun matches(expected: String, actual: String?): Boolean {
+        if (actual == null || actual.length != expected.length) return false
+        var diff = 0
+        for (i in expected.indices) diff = diff or (expected[i].code xor actual[i].code)
+        return diff == 0
+    }
 }
 
 /** S7 PhotoRelay 짝짓기 서버와 통신 (집 Wi-Fi 안쪽 HTTP) */
-class RelayClient(private val host: String, private val port: Int, private val token: String? = null) {
+class RelayClient(private val host: String, private val port: Int, private val token: String? = null, private val secret: String = "") {
     class RelayException(val code: Int, message: String) : Exception(message)
+    class BadSignature : java.io.IOException("S7 응답 서명이 맞지 않음 (가짜 서버?)")
 
     private val base get() = "http://$host:$port"
 
-    fun info(): JSONObject = call("GET", "/api/info", null)
+    /** 주소 확인용: 엉뚱한 기기가 포트만 열어 두고 답을 안 하면 금방 포기한다 */
+    fun info(): JSONObject = call("GET", "/api/info", null, quick).first
 
-    fun pair(code: String, device: String): Pair<String, String> {
-        val o = call("POST", "/api/pair", JSONObject().put("code", code).put("device", device))
-        return o.getString("token") to o.optString("name")
+    data class Paired(val token: String, val name: String, val secret: String)
+
+    fun pair(code: String, device: String): Paired {
+        val (o, _) = call("POST", "/api/pair", JSONObject().put("code", code).put("device", device))
+        return Paired(o.getString("token"), o.optString("name"), o.optString("secret"))
     }
 
     /** inCloud: 구글포토에 원본 화질로 있는 지문, relayed: S7이 OneDrive에서 받은 기록이 있는 지문 */
@@ -87,9 +111,11 @@ class RelayClient(private val host: String, private val port: Int, private val t
         val relayed = mutableSetOf<String>()
         var done = 0
         keys.chunked(BATCH).forEach { batch ->
-            val o = withRetry({ attempt -> onProgress(done, keys.size, attempt) }) {
+            val (o, sig) = withRetry({ attempt -> onProgress(done, keys.size, attempt) }) {
                 call("POST", "/api/check", JSONObject().put("keys", JSONArray(batch)))
             }
+            // 서명 비밀값이 있으면 답이 정말 짝지은 S7에서 왔는지 확인한다 (같은 Wi-Fi의 다른 기기가 "다 지워도 됨"이라고 속이지 못하게)
+            if (secret.isNotEmpty() && !Sig.matches(Sig.hmacHex(secret, sig.second), sig.first)) throw BadSignature()
             done += batch.size
             onProgress(done, keys.size, null)
             o.getJSONArray("inCloud").let { a -> for (i in 0 until a.length()) inCloud += a.getString(i) }
@@ -101,12 +127,17 @@ class RelayClient(private val host: String, private val port: Int, private val t
 
     fun report(text: String) = runCatching { call("POST", "/api/report", JSONObject().put("text", text)) }
 
+    /** 서명 확인이 켜져 있는지 (예전 짝짓기에는 비밀값이 없다) */
+    val verifies get() = secret.isNotEmpty()
+
     /** 네트워크 오류(S7 Wi-Fi 끊김, 시간 초과)는 3번까지 다시 시도. 인증 실패 같은 응답 오류는 바로 실패. */
     private fun <T> withRetry(onRetry: (Int) -> Unit = {}, block: () -> T): T {
         var last: Exception? = null
         for (attempt in 0 until 3) {
             try {
                 return block()
+            } catch (e: BadSignature) {
+                throw e
             } catch (e: java.io.IOException) {
                 last = e
                 onRetry(attempt + 1)
@@ -116,16 +147,17 @@ class RelayClient(private val host: String, private val port: Int, private val t
         throw last!!
     }
 
-    private fun call(method: String, path: String, body: JSONObject?): JSONObject {
+    /** 응답 JSON과 (X-Signature 헤더, 원문) */
+    private fun call(method: String, path: String, body: JSONObject?, client: OkHttpClient = http): Pair<JSONObject, Pair<String?, String>> {
         val req = Request.Builder().url(base + path).apply {
             if (token != null) header("Authorization", "Bearer $token")
             if (body != null) method(method, body.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
         }.build()
-        http.newCall(req).execute().use { r ->
+        client.newCall(req).execute().use { r ->
             val text = r.body?.string().orEmpty()
             val o = runCatching { JSONObject(text) }.getOrElse { JSONObject() }
             if (!r.isSuccessful) throw RelayException(r.code, o.optString("error").ifEmpty { "S7 응답 ${r.code}" })
-            return o
+            return o to (r.header("X-Signature") to text)
         }
     }
 
@@ -133,6 +165,7 @@ class RelayClient(private val host: String, private val port: Int, private val t
         const val BATCH = 500
         // 첫 확인은 S7이 구글포토 DB를 복사하느라 수십 초 걸릴 수 있다 (S7이 다른 작업 중이면 더)
         private val http = OkHttpClient.Builder().connectTimeout(8, TimeUnit.SECONDS).readTimeout(300, TimeUnit.SECONDS).build()
+        private val quick = OkHttpClient.Builder().connectTimeout(3, TimeUnit.SECONDS).readTimeout(5, TimeUnit.SECONDS).build()
     }
 }
 

@@ -30,7 +30,11 @@ data class CleanStatus(val running: Boolean = false, val text: String = "")
 object CleanState {
     private val _s = MutableStateFlow(CleanStatus())
     val status: StateFlow<CleanStatus> = _s
+    private val running = java.util.concurrent.atomic.AtomicBoolean(false)
     fun set(s: CleanStatus) { _s.value = s }
+    /** 두 워커(정기·지금)가 동시에 시작하지 않도록 한 번에 하나만 */
+    fun tryStart(): Boolean = running.compareAndSet(false, true)
+    fun finish(text: String) { _s.value = CleanStatus(false, text); running.set(false) }
 }
 
 /**
@@ -41,26 +45,34 @@ class CleanWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx,
     override suspend fun getForegroundInfo(): ForegroundInfo = foregroundInfo(applicationContext, "사진 정리 중")
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
-        if (CleanState.status.value.running) return@withContext Result.success()
+        if (!CleanState.tryStart()) return@withContext Result.success()
         // 배터리 최적화 제외가 안 된 상태에서 백그라운드로 시작되면 Android가 거부할 수 있다. 그래도 정리는 계속한다.
         runCatching { setForeground(getForegroundInfo()) }.onFailure { Log.w(TAG, "foreground 불가: ${it.message}") }
         @Suppress("DEPRECATION")
         val wifiLock = (applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager)
             .createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "PhotoRelayCompanion:clean").apply { setReferenceCounted(false); acquire() }
         CleanState.set(CleanStatus(true, "정리 시작"))
+        var text = "정리 중단됨"
         try {
-            val r = Cleaner(applicationContext) { CleanState.set(CleanStatus(true, it)) }.run()
-            CleanState.set(CleanStatus(false, r.text()))
+            val r = Cleaner(applicationContext, { CleanState.set(CleanStatus(true, it)) }, { isStopped }).run()
+            text = r.text()
         } catch (e: Exception) {
             val why = "${e.javaClass.simpleName}: ${e.message ?: ""}".take(200)
-            val text = if (e is java.io.IOException) "S7에 연결 안 됨 (같은 Wi-Fi에서 다시 시도) — $why" else "정리 실패 — $why"
-            CleanState.set(CleanStatus(false, text))
+            text = when (e) {
+                is RelayClient.BadSignature -> "정리 중지 — ${e.message}. S7 설정에서 다시 연결하세요"
+                is java.io.IOException -> "S7에 연결 안 됨 (같은 Wi-Fi에서 다시 시도) — $why"
+                else -> "정리 실패 — $why"
+            }
             val prefs = CompanionPrefs(applicationContext)
             prefs.lastResult = text
             prefs.lastRunMs = System.currentTimeMillis()
             // 연결은 됐다가 중간에 실패한 경우 S7 기록에도 남긴다 (원격으로 원인 확인용)
-            if (prefs.paired) RelayClient(prefs.host, prefs.port, prefs.token).report("${Build.MODEL} 오류: $why")
+            if (prefs.paired && e !is RelayClient.BadSignature) {
+                RelayClient(prefs.host, prefs.port, prefs.token).report("${Cleaner.deviceName(applicationContext)} 오류: $why")
+            }
         } finally {
+            // OutOfMemoryError 같은 Error가 나도 "정리 중"으로 영영 남지 않게
+            CleanState.finish(text)
             runCatching { wifiLock.release() }
         }
         Result.success()

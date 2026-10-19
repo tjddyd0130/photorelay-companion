@@ -115,14 +115,17 @@ class CompanionViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun pair() {
-        val h = host.trim().substringBefore(':')
-        val port = host.trim().substringAfter(':', "47321").toIntOrNull() ?: 47321
+        // "http://192.168.0.10:47321/" 처럼 붙여 넣어도 되게
+        val raw = host.trim().substringAfter("://").trimEnd('/')
+        val h = raw.substringBefore(':')
+        val port = raw.substringAfter(':', "47321").toIntOrNull() ?: 47321
         message = "연결 중…"
         viewModelScope.launch(Dispatchers.IO) {
             message = try {
-                val (token, name) = RelayClient(h, port).pair(code.filter(Char::isDigit), "${Build.MODEL} (${Build.DEVICE})")
-                p.host = h; p.port = port; p.token = token; p.serverName = name; p.knownHosts = p.knownHosts + h
-                paired = true; serverName = name
+                val r = RelayClient(h, port).pair(code.filter(Char::isDigit), Cleaner.deviceName(getApplication()))
+                p.host = h; p.port = port; p.token = r.token; p.secret = r.secret; p.serverName = r.name; p.knownHosts = setOf(h)
+                paired = true; serverName = r.name; verified = r.secret.isNotEmpty()
+                val name = r.name
                 CleanScheduler.apply(getApplication())
                 "$name 과 연결됐습니다"
             } catch (e: Exception) {
@@ -144,9 +147,13 @@ class CompanionViewModel(app: Application) : AndroidViewModel(app) {
     }
     fun changeOnlyRelayed(v: Boolean) { p.onlyRelayed = v; onlyRelayed = v }
 
-    fun unpair() { p.unpair(); paired = false }
+    var verified by mutableStateOf(p.secret.isNotEmpty()); private set
+
+    fun unpair() { p.unpair(); paired = false; realDelete = false; CleanScheduler.apply(getApplication()) }
     fun changeKeepDays(v: Int) { p.keepDays = v; keepDays = v }
     fun changeRealDelete(v: Boolean) { p.realDelete = v; realDelete = v }
+    val mediaLocation get() = getApplication<Application>().checkSelfPermission(Manifest.permission.ACCESS_MEDIA_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
     fun changeAuto(v: Boolean) { p.autoEnabled = v; autoEnabled = v; CleanScheduler.apply(getApplication()) }
     fun runNow() = CleanScheduler.runNow(getApplication())
 
@@ -222,6 +229,28 @@ private fun Screen(vm: CompanionViewModel = viewModel()) {
                 val (n, b) = vm.totals
                 Text("지금까지 ${n}개 삭제 · ${"%.1f".format(b / 1073741824.0)}GB 확보", fontSize = 13.sp, fontWeight = FontWeight.Medium)
                 Button(onClick = vm::runNow, enabled = !st.running) { Text(if (vm.realDelete) "지금 정리" else "지금 미리보기") }
+            }
+        }
+
+        if (!vm.verified) {
+            Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer)) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("다시 연결을 권장합니다", fontWeight = FontWeight.SemiBold)
+                    Text("새 버전은 S7의 답에 서명을 붙여 같은 Wi-Fi의 다른 기기가 S7인 척하지 못하게 합니다. 예전에 연결한 상태라 서명이 없으니, S7 설정에서 코드를 새로 만들어 한 번 더 연결해 주세요.", fontSize = 13.sp)
+                    OutlinedButton(onClick = vm::unpair) { Text("연결 해제하고 다시 연결") }
+                }
+            }
+        }
+
+        if (!vm.mediaLocation) {
+            Card(Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("권한 필요: 사진 위치 정보", fontWeight = FontWeight.SemiBold)
+                    Text("원본 그대로 지문을 내려면 필요합니다. 없으면 구글포토와 비교할 수 없어 아무것도 정리하지 않습니다.", fontSize = 13.sp)
+                    OutlinedButton(onClick = {
+                        ctx.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${ctx.packageName}")))
+                    }) { Text("앱 권한 열기") }
+                }
             }
         }
 

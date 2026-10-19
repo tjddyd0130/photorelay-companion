@@ -80,6 +80,8 @@ object Updater {
         check(info.longVersionCode > BuildConfig.VERSION_CODE) { "더 높은 버전이 아님 (${info.longVersionCode})" }
 
         val installer = ctx.packageManager.packageInstaller
+        // 지난번에 확인을 안 눌러 남아 있는 설치 세션은 버린다 (쌓이면 새 세션을 못 만든다)
+        installer.mySessions.forEach { runCatching { installer.abandonSession(it.sessionId) } }
         val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL).apply {
             setAppPackageName(ctx.packageName)
             // Android 12+: 이 앱이 직접 설치한 앱이면 확인 창 없이 업데이트
@@ -94,6 +96,7 @@ object Updater {
             )
             s.commit(pi.intentSender)
         }
+        apk.delete() // 세션에 복사됐으니 원본은 필요 없다
         Log.i(TAG, "update ${r.versionName} committed")
     }
 

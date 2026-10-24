@@ -117,6 +117,7 @@ class Cleaner(
         val check = client.check(keys.values.distinct()) { done, total, retry ->
             progress("S7에 구글포토 확인 중 $done/$total" + (retry?.let { " — 연결 불안정, 다시 시도 중 ($it)" } ?: ""))
         }
+        if (check.heartbeatUrl.isNotEmpty()) prefs.heartbeatUrl = check.heartbeatUrl
         val targets = selectTargets(keys, check.inCloud, check.relayed, prefs.onlyRelayed)
         val inCloudCount = keys.count { it.value in check.inCloud }
         r = r.copy(

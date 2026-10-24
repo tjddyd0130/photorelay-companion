@@ -60,6 +60,12 @@ class CompanionPrefs(context: Context) {
     var lastResult: String get() = p.getString("lastResult", "")!!; set(v) = p.edit().putString("lastResult", v).apply()
     var lastRunMs: Long get() = p.getLong("lastRunMs", 0); set(v) = p.edit().putLong("lastRunMs", v).apply()
     var totalDeleted: Long get() = p.getLong("totalDeleted", 0); set(v) = p.edit().putLong("totalDeleted", v).apply()
+    /** S7 하트비트를 읽을 ntfy 주소 (짝지은 S7이 서명된 응답으로 알려 줌) */
+    var heartbeatUrl: String get() = p.getString("heartbeatUrl", "")!!; set(v) = p.edit().putString("heartbeatUrl", v).apply()
+    var lastHeartbeatMs: Long get() = p.getLong("lastHeartbeatMs", 0); set(v) = p.edit().putLong("lastHeartbeatMs", v).apply()
+    var s7Down: Boolean get() = p.getBoolean("s7Down", false); set(v) = p.edit().putBoolean("s7Down", v).apply()
+    var s7AlertedAt: Long get() = p.getLong("s7AlertedAt", 0); set(v) = p.edit().putLong("s7AlertedAt", v).apply()
+
     /** 마지막 업데이트 확인 결과 */
     var updateStatus: String get() = p.getString("updateStatus", "")!!; set(v) = p.edit().putString("updateStatus", v).apply()
     var totalFreed: Long get() = p.getLong("totalFreed", 0); set(v) = p.edit().putLong("totalFreed", v).apply()
@@ -103,12 +109,13 @@ class RelayClient(private val host: String, private val port: Int, private val t
     }
 
     /** inCloud: 구글포토에 원본 화질로 있는 지문, relayed: S7이 OneDrive에서 받은 기록이 있는 지문 */
-    data class CheckResult(val inCloud: Set<String>, val relayed: Set<String>)
+    data class CheckResult(val inCloud: Set<String>, val relayed: Set<String>, val heartbeatUrl: String = "")
 
     /** onProgress(확인한 수, 전체, 다시 시도 중이면 몇 번째인지) */
     fun check(keys: List<String>, onProgress: (Int, Int, Int?) -> Unit = { _, _, _ -> }): CheckResult {
         val inCloud = mutableSetOf<String>()
         val relayed = mutableSetOf<String>()
+        var heartbeat = ""
         var done = 0
         keys.chunked(BATCH).forEach { batch ->
             val (o, sig) = withRetry({ attempt -> onProgress(done, keys.size, attempt) }) {
@@ -121,8 +128,10 @@ class RelayClient(private val host: String, private val port: Int, private val t
             o.getJSONArray("inCloud").let { a -> for (i in 0 until a.length()) inCloud += a.getString(i) }
             // 예전 S7 앱은 relayed를 주지 않는다 → 비어 있으면 "S7이 받은 사진만" 조건에서 아무것도 지우지 않게 됨 (안전한 쪽)
             o.optJSONArray("relayed")?.let { a -> for (i in 0 until a.length()) relayed += a.getString(i) }
+            // 서명된 응답에서만 받아들인다 (가짜 서버가 엉뚱한 주소를 심지 못하게)
+            if (secret.isNotEmpty()) o.optString("heartbeat").takeIf { it.startsWith("https://") }?.let { heartbeat = it }
         }
-        return CheckResult(inCloud, relayed)
+        return CheckResult(inCloud, relayed, heartbeat)
     }
 
     fun report(text: String) = runCatching { call("POST", "/api/report", JSONObject().put("text", text)) }

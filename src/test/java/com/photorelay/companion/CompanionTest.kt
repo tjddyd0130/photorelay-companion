@@ -77,4 +77,24 @@ class CompanionTest {
         assertTrue(!Sig.matches("abcd", null))
         assertTrue(!Sig.matches("abcd", "abc"))
     }
+
+    @Test
+    fun s7WatchDecisions() {
+        val h = 3_600_000L
+        val now = 100 * h
+        // 최근 하트비트: 조용
+        assertEquals(null, S7Watch.decide(now - h, now, false, 0).notify)
+        // 4시간째 없음: 알림, down
+        val d1 = S7Watch.decide(now - 4 * h, now, false, 0)
+        assertTrue(d1.notify!!.contains("4시간째") && d1.down)
+        // 이미 알렸으면 12시간 안에는 다시 안 알림
+        assertEquals(null, S7Watch.decide(now - 5 * h, now + h, true, now).notify)
+        // 12시간이 지나면 다시 알림
+        assertTrue(S7Watch.decide(now - 20 * h, now + 13 * h, true, now).notify != null)
+        // 돌아오면 정상 알림
+        val back = S7Watch.decide(now - 10 * 60_000, now, true, now - h)
+        assertTrue(back.notify!!.contains("정상") && !back.down)
+        // ntfy에 아무것도 없으면(12시간 넘게) 알림
+        assertTrue(S7Watch.decide(null, now, false, 0).notify!!.contains("12시간"))
+    }
 }

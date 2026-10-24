@@ -158,6 +158,7 @@ class CompanionViewModel(app: Application) : AndroidViewModel(app) {
     fun runNow() = CleanScheduler.runNow(getApplication())
 
     val lastResult get() = p.lastResult
+    val lastHeartbeat get() = p.lastHeartbeatMs
     val lastRun get() = p.lastRunMs
     val totals get() = p.totalDeleted to p.totalFreed
 }
@@ -173,6 +174,7 @@ class MainActivity : ComponentActivity() {
         ))
         CleanScheduler.apply(this)
         Updater.schedule(this)
+        S7Watch.schedule(this)
         setContent {
             MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme(primary = Color(0xFF8AB4F8)) else lightColorScheme(primary = Color(0xFF1A73E8))) {
                 Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) { Screen() }
@@ -226,6 +228,13 @@ private fun Screen(vm: CompanionViewModel = viewModel()) {
                 if (st.running) LinearProgressIndicator(Modifier.fillMaxWidth())
                 Text(st.text.ifEmpty { vm.lastResult.ifEmpty { "아직 실행 기록 없음" } }, fontSize = 13.sp)
                 if (vm.lastRun > 0) Text("마지막 실행 ${SimpleDateFormat("M/d HH:mm", Locale.KOREA).format(Date(vm.lastRun))}", fontSize = 12.sp)
+                if (vm.lastHeartbeat > 0) {
+                    val silent = System.currentTimeMillis() - vm.lastHeartbeat > S7Watch.DOWN_AFTER_MS
+                    Text(
+                        "S7 마지막 신호 ${SimpleDateFormat("M/d HH:mm", Locale.KOREA).format(Date(vm.lastHeartbeat))}" + if (silent) " — 응답 없음" else "",
+                        fontSize = 12.sp, color = if (silent) MaterialTheme.colorScheme.error else Color.Unspecified,
+                    )
+                }
                 val (n, b) = vm.totals
                 Text("지금까지 ${n}개 삭제 · ${"%.1f".format(b / 1073741824.0)}GB 확보", fontSize = 13.sp, fontWeight = FontWeight.Medium)
                 Button(onClick = vm::runNow, enabled = !st.running) { Text(if (vm.realDelete) "지금 정리" else "지금 미리보기") }

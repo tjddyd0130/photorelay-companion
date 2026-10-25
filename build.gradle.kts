@@ -12,8 +12,8 @@ android {
         applicationId = "com.photorelay.companion"
         minSdk = 31 // 메인폰 Galaxy S25 (Android 15+)
         targetSdk = 34
-        versionCode = 9
-        versionName = "0.5.0"
+        versionCode = 10
+        versionName = "0.6.0"
     }
 
     buildTypes {

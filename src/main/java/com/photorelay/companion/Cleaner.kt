@@ -31,18 +31,33 @@ data class CleanResult(
     val hashFailed: Int = 0,
     /** 작업 중 시스템이 멈춰 달라고 해서(충전 끊김 등) 중간에 그만둔 경우 */
     val stopped: Boolean = false,
+    /** S7 앱이 오래돼 "S7이 받은 사진" 정보를 안 줌 → 그 조건에서는 아무것도 못 지운다 */
+    val oldS7: Boolean = false,
 ) {
-    fun text(): String {
-        if (noAlbums) return "정리할 앨범을 먼저 고르세요"
-        val gb = "%.2fGB".format((if (preview) inGooglePhotosBytes else freedBytes) / 1073741824.0)
-        val more = (if (notRelayed > 0) " · S7 경유 아님 ${notRelayed}개 보존" else "") +
-            (if (hashFailed > 0) " · 지문 못 읽음 ${hashFailed}개 (사진 위치 권한 확인)" else "") +
-            (if (timedOut) " · 지문 계산은 다음 실행에서 이어서" else "") +
-            (if (stopped) " · 중단됨, 다음 실행에서 이어서" else "")
-        return if (preview) "미리보기: 지울 수 있음 ${inGooglePhotos}개($gb) · 아직 백업 안 됨 ${notYetBackedUp}개$more"
-        else "정리: ${deleted}개 삭제($gb 확보) · 아직 백업 안 됨 ${notYetBackedUp}개$more"
+    /** 첫 줄: 핵심 결과 */
+    fun headline(): String = when {
+        noAlbums -> "정리할 앨범을 먼저 고르세요"
+        preview -> "지울 수 있는 사진 ${inGooglePhotos}장 · ${formatSize(inGooglePhotosBytes)} (아직 지우지 않음)"
+        else -> "${deleted}장 정리 · ${formatSize(freedBytes)} 확보"
     }
+
+    /** 나머지 줄: 남긴 이유·이어서 할 일 */
+    fun details(): List<String> = if (noAlbums) emptyList() else listOfNotNull(
+        if (notYetBackedUp > 0) "구글포토에 아직 없는 사진 ${notYetBackedUp}장은 백업되면 다음에 정리" else null,
+        if (notRelayed > 0) "OneDrive를 거치지 않은 사진 ${notRelayed}장은 남김" else null,
+        if (oldS7) "S7 앱이 오래된 버전이라 지울 사진을 고르지 못했습니다. S7 앱을 업데이트하세요" else null,
+        if (hashFailed > 0) "읽지 못한 사진 ${hashFailed}장 (사진 권한 확인)" else null,
+        if (timedOut) "사진이 많아 나머지는 다음에 이어서 확인" else null,
+        if (stopped) "중간에 멈춰 다음에 이어서 진행" else null,
+    )
+
+    /** 한 줄 요약 (S7 기록·알림용) */
+    fun text(): String = (listOf(headline()) + details()).joinToString(" · ")
 }
+
+/** 1GB 미만은 MB, 이상은 소수 한 자리 GB */
+fun formatSize(bytes: Long): String =
+    if (bytes < 1_000_000_000L) "${(bytes + 524_288) / 1_048_576}MB" else "%.1fGB".format(bytes / 1073741824.0)
 
 data class Album(val path: String, val label: String, val count: Int, val bytes: Long)
 
@@ -91,7 +106,7 @@ class Cleaner(
         val real = prefs.realDelete
         val albums = prefs.albums
         if (albums.isEmpty()) {
-            return CleanResult(preview = !real, noAlbums = true).also { prefs.lastResult = it.text(); prefs.lastRunMs = System.currentTimeMillis() }
+            return CleanResult(preview = !real, noAlbums = true).also { prefs.lastResult = it.text(); prefs.lastRunMs = System.currentTimeMillis(); prefs.lastKind = "ok" }
         }
         val photos = scan(albums)
         val now = System.currentTimeMillis()
@@ -105,7 +120,7 @@ class Cleaner(
             if (cached != null) { keys[p] = cached; continue }
             if (System.currentTimeMillis() - started > budgetMs) { r = r.copy(timedOut = true); break }
             if (shouldStop()) { r = r.copy(stopped = true); break }
-            progress("지문 계산 ${i + 1}/${old.size}: ${p.name}")
+            progress("1/3 사진 확인 중 (${i + 1}/${old.size})")
             val k = hash(p.uri)
             if (k == null) { r = r.copy(hashFailed = r.hashFailed + 1); continue }
             cache.put(p, k)
@@ -113,9 +128,9 @@ class Cleaner(
             r = r.copy(hashed = r.hashed + 1)
         }
 
-        progress("S7에 구글포토 확인 요청 (${keys.size}개)")
+        progress("2/3 S7에 백업 확인 중 (0/${keys.size})")
         val check = client.check(keys.values.distinct()) { done, total, retry ->
-            progress("S7에 구글포토 확인 중 $done/$total" + (retry?.let { " — 연결 불안정, 다시 시도 중 ($it)" } ?: ""))
+            progress("2/3 S7에 백업 확인 중 ($done/$total)" + (retry?.let { " · 연결이 불안정해 다시 시도하는 중…" } ?: ""))
         }
         if (check.heartbeatUrl.isNotEmpty()) prefs.heartbeatUrl = check.heartbeatUrl
         val targets = selectTargets(keys, check.inCloud, check.relayed, prefs.onlyRelayed)
@@ -125,13 +140,15 @@ class Cleaner(
             inGooglePhotosBytes = targets.keys.sumOf { it.size },
             notYetBackedUp = keys.size - inCloudCount,
             notRelayed = inCloudCount - targets.size,
+            oldS7 = prefs.onlyRelayed && !check.relayedKnown && inCloudCount > 0,
         )
+        if (!real) { prefs.previewCount = r.inGooglePhotos; prefs.previewBytes = r.inGooglePhotosBytes }
 
         if (real) {
             for ((i, e) in targets.entries.withIndex()) {
                 val (p, k) = e
                 if (shouldStop() || System.currentTimeMillis() - started > budgetMs + DELETE_BUDGET_MS) { r = r.copy(stopped = true); break }
-                progress("삭제 ${i + 1}/${targets.size}: ${p.name}")
+                progress("3/3 지우는 중 (${i + 1}/${targets.size})")
                 // 지우기 직전 재확인: 파일 내용이 그대로인지
                 if (hash(p.uri) != k) continue
                 if (runCatching { resolver.delete(p.uri, null, null) }.getOrDefault(0) > 0) {
@@ -143,6 +160,9 @@ class Cleaner(
         }
         prefs.lastResult = r.text()
         prefs.lastRunMs = System.currentTimeMillis()
+        prefs.lastKind = "ok"
+        prefs.lastGood = r.text()
+        prefs.lastGoodMs = prefs.lastRunMs
         client.report("${deviceName(ctx)}: ${r.text()}")
         return r
     }
@@ -161,10 +181,10 @@ class Cleaner(
             return RelayClient(host, port, prefs.token, prefs.secret)
         }
         if (alive(prefs.host, prefs.port)) return use(prefs.host, prefs.port)
-        progress("S7 주소 다시 찾는 중")
+        progress("S7 찾는 중…")
         prefs.knownHosts.filter { it != prefs.host }.firstOrNull { alive(it, prefs.port) }?.let { return use(it, prefs.port) }
         Discovery.find(ctx).firstOrNull { alive(it.host, it.port) }?.let { return use(it.host, it.port) }
-        progress("S7 주소 다시 찾는 중 (Wi-Fi 전체 확인)")
+        progress("S7 찾는 중… (집 Wi-Fi 전체 확인)")
         Discovery.scanSubnet(ctx, prefs.port).firstOrNull()?.let { return use(it.host, it.port) }
         throw java.io.IOException("같은 Wi-Fi에서 S7을 찾지 못함 (저장된 주소 ${prefs.host})")
     }

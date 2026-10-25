@@ -43,9 +43,11 @@ class CompanionTest {
     @Test
     fun resultText() {
         val preview = CleanResult(inGooglePhotos = 10, inGooglePhotosBytes = 2L * 1073741824, notYetBackedUp = 4, preview = true)
-        assertEquals("미리보기: 지울 수 있음 10개(2.00GB) · 아직 백업 안 됨 4개", preview.text())
+        assertEquals("지울 수 있는 사진 10장 · 2.0GB (아직 지우지 않음) · 구글포토에 아직 없는 사진 4장은 백업되면 다음에 정리", preview.text())
         val real = CleanResult(deleted = 9, freedBytes = 1073741824, notYetBackedUp = 1, preview = false, timedOut = true)
-        assertEquals("정리: 9개 삭제(1.00GB 확보) · 아직 백업 안 됨 1개 · 지문 계산은 다음 실행에서 이어서", real.text())
+        assertEquals("9장 정리 · 1.0GB 확보 · 구글포토에 아직 없는 사진 1장은 백업되면 다음에 정리 · 사진이 많아 나머지는 다음에 이어서 확인", real.text())
+        assertEquals("350MB", formatSize(350L * 1048576))
+        assertEquals("0MB", formatSize(0))
     }
 
     @Test

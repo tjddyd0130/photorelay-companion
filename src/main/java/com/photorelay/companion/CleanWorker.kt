@@ -57,14 +57,13 @@ class CleanWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx,
             val r = Cleaner(applicationContext, { CleanState.set(CleanStatus(true, it)) }, { isStopped }).run()
             text = r.text()
         } catch (e: Exception) {
+            // 원문 예외는 S7 기록에만 남기고, 화면에는 무엇을 하면 되는지만 보여 준다
             val why = "${e.javaClass.simpleName}: ${e.message ?: ""}".take(200)
-            text = when (e) {
-                is RelayClient.BadSignature -> "정리 중지 — ${e.message}. S7 설정에서 다시 연결하세요"
-                is java.io.IOException -> "S7에 연결 안 됨 (같은 Wi-Fi에서 다시 시도) — $why"
-                else -> "정리 실패 — $why"
-            }
+            val (kind, friendly) = friendlyError(e)
+            text = friendly
             val prefs = CompanionPrefs(applicationContext)
             prefs.lastResult = text
+            prefs.lastKind = kind
             prefs.lastRunMs = System.currentTimeMillis()
             // 연결은 됐다가 중간에 실패한 경우 S7 기록에도 남긴다 (원격으로 원인 확인용)
             if (prefs.paired && e !is RelayClient.BadSignature) {
@@ -80,6 +79,17 @@ class CleanWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx,
 
     companion object {
         private const val TAG = "PhotoRelayCompanion"
+
+        /** (종류, 화면 문구). 종류는 화면이 색과 버튼을 고르는 데 쓴다 */
+        fun friendlyError(e: Throwable): Pair<String, String> = when {
+            e is RelayClient.BadSignature -> "badsig" to "S7이 아닌 기기가 응답해 정리를 멈췄습니다. 안전을 위해 S7과 다시 연결해 주세요"
+            e is RelayClient.RelayException && (e.code == 401 || e.code == 403) -> "auth" to "S7과의 연결이 끊겼습니다. 다시 연결해 주세요"
+            e is RelayClient.RelayException && e.code == 503 -> "error" to "S7이 구글포토를 확인할 수 없는 상태라 이번엔 건너뛰었습니다"
+            e is java.io.IOException -> "away" to "집 Wi-Fi가 아니거나 S7이 응답하지 않아 이번엔 건너뛰었습니다"
+            e.message?.contains("위치") == true -> "perm" to "사진 위치 권한이 없어 확인하지 못했습니다"
+            e.message?.contains("연결되지 않음") == true -> "auth" to "S7과 연결되어 있지 않습니다"
+            else -> "error" to "정리하지 못했습니다. 다음에 다시 시도합니다"
+        }
         private const val CHANNEL = "clean"
         private const val NOTIFICATION_ID = 1
 

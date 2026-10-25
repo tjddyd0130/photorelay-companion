@@ -102,12 +102,15 @@ object Updater {
 
     /** 정리 중이 아니면 확인하고, 새 버전이면 설치. 결과 문구를 돌려준다. */
     fun checkAndInstall(ctx: Context): String {
-        if (CleanState.status.value.running) return "정리 중이라 다음에 확인"
-        val r = latest() ?: return "릴리스 없음"
-        if (!isNewer(r)) return "최신 버전 (${BuildConfig.VERSION_NAME})"
-        if (!ctx.packageManager.canRequestPackageInstalls()) return "새 버전 ${r.versionName} 있음 — '앱 설치 허용'이 필요합니다"
+        if (CleanState.status.value.running) return "정리 중이라 다음에 확인합니다"
+        val p = CompanionPrefs(ctx)
+        p.updateCheckedMs = System.currentTimeMillis()
+        val r = latest()
+        if (r == null || !isNewer(r)) { p.updatePending = ""; return "최신 버전입니다" }
+        p.updatePending = r.versionName
+        if (!ctx.packageManager.canRequestPackageInstalls()) return "새 버전 ${r.versionName}이 있습니다. 설치하려면 '앱 설치 허용'을 켜 주세요"
         downloadAndInstall(ctx, r)
-        return "새 버전 ${r.versionName} 설치 중"
+        return "새 버전 ${r.versionName}을 설치하는 중…"
     }
 
     fun schedule(ctx: Context) {
@@ -121,7 +124,7 @@ object Updater {
 /** 하루 한 번 GitHub에서 새 버전 확인 */
 class UpdateWorker(ctx: Context, params: WorkerParameters) : CoroutineWorker(ctx, params) {
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
-        val text = runCatching { Updater.checkAndInstall(applicationContext) }.getOrElse { "업데이트 확인 실패: ${it.message}" }
+        val text = runCatching { Updater.checkAndInstall(applicationContext) }.getOrElse { "업데이트를 확인하지 못했습니다. 내일 다시 확인합니다" }
         CompanionPrefs(applicationContext).updateStatus = text
         Result.success()
     }
@@ -136,7 +139,7 @@ class UpdateReceiver : BroadcastReceiver() {
                 @Suppress("DEPRECATION")
                 val confirm = intent.getParcelableExtra<Intent>(Intent.EXTRA_INTENT) ?: return
                 confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                prefs.updateStatus = "업데이트 설치 확인 필요 (알림을 누르세요)"
+                prefs.updateStatus = "설치 확인이 필요합니다. 알림을 눌러 설치해 주세요"
                 val nm = context.getSystemService(NotificationManager::class.java)
                 nm.createNotificationChannel(NotificationChannel("update", "앱 업데이트", NotificationManager.IMPORTANCE_DEFAULT))
                 val pi = PendingIntent.getActivity(context, 0, confirm, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
@@ -153,8 +156,11 @@ class UpdateReceiver : BroadcastReceiver() {
                 // 앱을 보고 있으면 바로 확인 창을 연다
                 runCatching { context.startActivity(confirm) }
             }
-            PackageInstaller.STATUS_SUCCESS -> prefs.updateStatus = "업데이트 완료"
-            else -> prefs.updateStatus = "업데이트 실패 ($status): ${intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE) ?: ""}"
+            PackageInstaller.STATUS_SUCCESS -> { prefs.updateStatus = "업데이트했습니다"; prefs.updatePending = "" }
+            else -> {
+                Log.w("PhotoRelayCompanion", "update failed $status ${intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE)}")
+                prefs.updateStatus = "업데이트 설치에 실패했습니다. 다시 시도해 주세요"
+            }
         }
     }
 }
